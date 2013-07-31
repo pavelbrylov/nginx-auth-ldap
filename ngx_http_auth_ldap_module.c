@@ -27,6 +27,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <ngx_sha1.h>
 #include <ldap.h>
 
 typedef struct {
@@ -68,6 +69,27 @@ typedef struct {
 } ngx_http_auth_ldap_conf_t;
 
 
+
+// the shm segment that houses the used cache nodes tree
+static ngx_uint_t      ngx_http_auth_ldap_shm_size;
+static ngx_shm_zone_t *ngx_http_auth_ldap_shm_zone;
+static ngx_rbtree_t   *ngx_http_auth_ldap_rbtree;
+// nonce cleanup
+#define NGX_HTTP_AUTH_LDAP_CLEANUP_INTERVAL 3000
+#define NGX_HTTP_AUTH_LDAP_CLEANUP_BATCH_SIZE 2048
+ngx_event_t *ngx_http_auth_ldap_cleanup_timer;
+static ngx_array_t *ngx_http_auth_ldap_cleanup_list;
+static ngx_atomic_t *ngx_http_auth_ldap_cleanup_lock;
+
+// nonce entries in the rbtree
+typedef struct {
+    ngx_rbtree_node_t node;    // the node's .key is derived from the nonce val
+    time_t            expires; // time at which the node should be evicted
+    ngx_str_t username;
+    ngx_str_t password_hash;
+    ngx_str_t server_alias;
+} ngx_http_auth_ldap_node_t;
+
 static void * ngx_http_auth_ldap_create_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char * ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_ldap_server *server);
@@ -86,6 +108,22 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
         ngx_http_auth_ldap_conf_t *mconf);
 static char * ngx_http_auth_ldap(ngx_conf_t *cf, void *post, void *data);
 static ngx_conf_post_handler_pt ngx_http_auth_ldap_p = ngx_http_auth_ldap;
+static ngx_int_t ngx_http_auth_ldap_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data);
+static void ngx_http_auth_ldap_rbtree_insert(ngx_rbtree_node_t *temp,
+       ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+static int ngx_http_auth_ldap_rbtree_cmp(const ngx_rbtree_node_t *v_left,
+       const ngx_rbtree_node_t *v_right);
+static void ngx_rbtree_generic_insert(ngx_rbtree_node_t *temp, ngx_rbtree_node_t *node,
+       ngx_rbtree_node_t *sentinel, int (*compare)(const ngx_rbtree_node_t *left, const ngx_rbtree_node_t *right));
+void ngx_http_auth_ldap_cleanup(ngx_event_t *ev);
+static ngx_int_t ngx_http_auth_ldap_worker_init(ngx_cycle_t *cycle);
+static void ngx_http_auth_ldap_rbtree_prune(ngx_log_t *log);
+static void ngx_http_auth_ldap_rbtree_prune_walk(ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel, time_t now, ngx_log_t *log);
+static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request_t *r, ngx_ldap_userinfo *uinfo, ngx_ldap_server *server);
+static ngx_rbtree_node_t * ngx_http_auth_ldap_rbtree_find(ngx_rbtree_key_t key, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo, ngx_ldap_server *server);
+static ngx_str_t ngx_http_auth_ldap_get_password_hash (ngx_str_t *username, ngx_str_t *password);
+
 
 static ngx_command_t ngx_http_auth_ldap_commands[] = {
     {
@@ -133,7 +171,7 @@ ngx_module_t ngx_http_auth_ldap_module = {
     NGX_HTTP_MODULE, /* module type */
     NULL, /* init master */
     NULL, /* init module */
-    NULL, /* init process */
+    ngx_http_auth_ldap_worker_init, /* init process */
     NULL, /* init thread */
     NULL, /* exit thread */
     NULL, /* exit process */
@@ -556,7 +594,6 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
     ngx_flag_t pass = NGX_CONF_UNSET;
 
     uinfo = ngx_http_auth_ldap_get_user_info(r);
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "LDAP username: %s", uinfo->username.data);
 
     if (uinfo == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -566,6 +603,11 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
     {
         return ngx_http_auth_ldap_set_realm(r, &conf->realm);
     }
+
+    ngx_slab_pool_t                        *shpool;
+    ngx_uint_t                             key;
+
+    shpool = (ngx_slab_pool_t *)ngx_http_auth_ldap_shm_zone->shm.addr;
 
     /// Set LDAP version to 3 and set connection timeout.
     ldap_set_option(NULL, LDAP_OPT_PROTOCOL_VERSION, &version);
@@ -586,8 +628,32 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
             server = &servers[i];
             if (server->alias.len == alias->len && ngx_strncmp(server->alias.data, alias->data, server->alias.len) == 0) {
                 found = 1;
+
+                key = nginx_http_auth_ldap_get_cache_key(uinfo, server);
+                // TODO: Mutex??
+                ngx_shmtx_lock(&shpool->mutex);
+                ngx_http_auth_ldap_node_t *found = (ngx_http_auth_ldap_node_t *)ngx_http_auth_ldap_rbtree_find(
+                        key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
+
+                ngx_shmtx_unlock(&shpool->mutex);
+                if (found != NULL) {
+                    if (uinfo->username.len == found->username.len && (ngx_strcmp(uinfo->username.data, found->username.data) == 0)) {
+                        ngx_str_t hash = ngx_http_auth_ldap_get_password_hash(&uinfo->username, &uinfo->password);
+                        if (hash.len == found->password_hash.len) {
+                            return NGX_OK;
+                        } else {
+                            // TODO: Really?
+                            return ngx_http_auth_ldap_set_realm(r, &conf->realm);
+                        }
+                    } else {
+                        // TODO: Should be warning
+                        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "USERNAME IS NOT SAME!", NULL);
+                    }
+                }
+
                 pass = ngx_http_auth_ldap_authenticate_against_server(r, server, uinfo, conf);
                 if (pass == 1) {
+                    ngx_http_auth_ldap_cache_store(r, uinfo, server);
                     return NGX_OK;
                 } else if (pass == NGX_HTTP_INTERNAL_SERVER_ERROR) {
                    return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -806,11 +872,305 @@ static ngx_int_t ngx_http_auth_ldap_set_realm(ngx_http_request_t *r, ngx_str_t *
 }
 
 /**
+ * Init shared memory zone
+ */
+static ngx_int_t
+ngx_http_auth_ldap_init_shm_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_slab_pool_t                *shpool;
+    ngx_rbtree_t                   *tree;
+    ngx_rbtree_node_t              *sentinel;
+    ngx_atomic_t                   *lock;
+    if (data) {
+        shm_zone->data = data;
+        return NGX_OK;
+    }
+
+    shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    tree = ngx_slab_alloc(shpool, sizeof *tree);
+    if (tree == NULL) {
+        return NGX_ERROR;
+    }
+
+    sentinel = ngx_slab_alloc(shpool, sizeof *sentinel);
+    if (sentinel == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_rbtree_init(tree, sentinel, ngx_http_auth_ldap_rbtree_insert);
+    shm_zone->data = tree;
+    ngx_http_auth_ldap_rbtree = tree;
+
+
+    lock = ngx_slab_alloc(shpool, sizeof(ngx_atomic_t));
+    if (lock == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_http_auth_ldap_cleanup_lock = lock;
+
+    return NGX_OK;
+}
+
+/**
+ * Insert new node into rbtree
+ */
+static void
+ngx_http_auth_ldap_rbtree_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel) {
+
+    ngx_rbtree_generic_insert(temp, node, sentinel, ngx_http_auth_ldap_rbtree_cmp);
+}
+
+/**
+ * Find rbtree nodes by key
+ */
+static ngx_rbtree_node_t *
+ngx_http_auth_ldap_rbtree_find(ngx_rbtree_key_t key, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel){
+
+    if (node==sentinel) return NULL;
+
+    ngx_rbtree_node_t *found = (node->key==key) ? node : NULL;
+    if (found==NULL && node->left != sentinel){
+        found = ngx_http_auth_ldap_rbtree_find(key, node->left, sentinel);
+    }
+    if (found==NULL && node->right != sentinel){
+        found = ngx_http_auth_ldap_rbtree_find(key, node->right, sentinel);
+    }
+
+    return found;
+}
+
+/**
+ * Compare rbtree nodes
+ */
+static int
+ngx_http_auth_ldap_rbtree_cmp(const ngx_rbtree_node_t *v_left,
+    const ngx_rbtree_node_t *v_right)
+{
+    if (v_left->key == v_right->key) return 0;
+    else return (v_left->key < v_right->key) ? -1 : 1;
+}
+
+/**
+ * Insert new node into rbtree
+ */
+static void
+ngx_rbtree_generic_insert(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel,
+    int (*compare)(const ngx_rbtree_node_t *left, const ngx_rbtree_node_t *right))
+{
+    for ( ;; ) {
+        if (node->key < temp->key) {
+
+            if (temp->left == sentinel) {
+                temp->left = node;
+                break;
+            }
+
+            temp = temp->left;
+
+        } else if (node->key > temp->key) {
+
+            if (temp->right == sentinel) {
+                temp->right = node;
+                break;
+            }
+
+            temp = temp->right;
+
+        } else { /* node->key == temp->key */
+            if (compare(node, temp) < 0) {
+
+                if (temp->left == sentinel) {
+                    temp->left = node;
+                    break;
+                }
+
+                temp = temp->left;
+
+            } else {
+
+                if (temp->right == sentinel) {
+                    temp->right = node;
+                    break;
+                }
+
+                temp = temp->right;
+            }
+        }
+    }
+
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+/**
+ * Cleanup handler for ldap authentication cache
+ */
+void ngx_http_auth_ldap_cleanup(ngx_event_t *ev){
+  if (ev->timer_set) ngx_del_timer(ev);
+  ngx_add_timer(ev, NGX_HTTP_AUTH_LDAP_CLEANUP_INTERVAL);
+
+  if (ngx_trylock(ngx_http_auth_ldap_cleanup_lock)){
+    ngx_http_auth_ldap_rbtree_prune(ev->log);
+    ngx_unlock(ngx_http_auth_ldap_cleanup_lock);
+  }
+}
+
+/**
+ * Prunes rbtree with ldap authentication cache
+ */
+static void ngx_http_auth_ldap_rbtree_prune(ngx_log_t *log){
+    ngx_uint_t i;
+    time_t now = ngx_time();
+    ngx_slab_pool_t *shpool = (ngx_slab_pool_t *)ngx_http_auth_ldap_shm_zone->shm.addr;
+
+    ngx_shmtx_lock(&shpool->mutex);
+    ngx_http_auth_ldap_cleanup_list->nelts = 0;
+    ngx_http_auth_ldap_rbtree_prune_walk(ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel, now, log);
+
+    ngx_rbtree_node_t **elts = (ngx_rbtree_node_t **)ngx_http_auth_ldap_cleanup_list->elts;
+    for (i=0; i<ngx_http_auth_ldap_cleanup_list->nelts; i++){
+        ngx_rbtree_delete(ngx_http_auth_ldap_rbtree, elts[i]);
+        ngx_slab_free_locked(shpool, elts[i]);
+    }
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    // if the cleanup array grew during the run, shrink it back down
+    if (ngx_http_auth_ldap_cleanup_list->nalloc > NGX_HTTP_AUTH_LDAP_CLEANUP_BATCH_SIZE){
+        ngx_array_t *old_list = ngx_http_auth_ldap_cleanup_list;
+        ngx_array_t *new_list = ngx_array_create(old_list->pool, NGX_HTTP_AUTH_LDAP_CLEANUP_BATCH_SIZE, sizeof(ngx_rbtree_node_t *));
+        if (new_list!=NULL){
+            ngx_array_destroy(old_list);
+            ngx_http_auth_ldap_cleanup_list = new_list;
+        } else {
+            ngx_log_error(NGX_LOG_ERR, log, 0, "auth_ldap ran out of cleanup space");
+        }
+    }
+}
+
+/**
+ * Walk through the tree and find elements which are expired
+ */
+static void ngx_http_auth_ldap_rbtree_prune_walk(ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel, time_t now, ngx_log_t *log){
+    if (node==sentinel) return;
+
+    if (node->left != sentinel){
+        ngx_http_auth_ldap_rbtree_prune_walk(node->left, sentinel, now, log);
+    }
+
+    if (node->right != sentinel){
+        ngx_http_auth_ldap_rbtree_prune_walk(node->right, sentinel, now, log);
+    }
+
+    ngx_http_auth_ldap_node_t *dnode = (ngx_http_auth_ldap_node_t*) node;
+    if (dnode->expires <= ngx_time()){
+        ngx_rbtree_node_t **dropnode = ngx_array_push(ngx_http_auth_ldap_cleanup_list);
+        dropnode[0] = node;
+    }
+}
+
+/**
+ * Returns simple hash key to use in rbtree
+ */
+static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo, ngx_ldap_server *server)
+{
+    return ngx_crc32_long(uinfo->username.data, uinfo->username.len) ^
+           ngx_crc32_long(server->alias.data, server->alias.len);
+
+}
+
+/**
+ * Stores ldap authentication cache to rbtree
+ */
+static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request_t *r, ngx_ldap_userinfo *uinfo, ngx_ldap_server *server){
+    ngx_slab_pool_t                        *shpool;
+    ngx_uint_t                             key;
+    ngx_http_auth_ldap_node_t              *node;
+
+    shpool = (ngx_slab_pool_t *)ngx_http_auth_ldap_shm_zone->shm.addr;
+
+    // create a cache record
+    key = nginx_http_auth_ldap_get_cache_key(uinfo, server);
+    ngx_shmtx_lock(&shpool->mutex);
+    ngx_rbtree_node_t *found = ngx_http_auth_ldap_rbtree_find(key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
+
+    if (found!=NULL){
+        ngx_shmtx_unlock(&shpool->mutex);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "Trying to store cache which already exist. This is so wrong and looks like hash collision!");
+    }
+
+    node = ngx_slab_alloc_locked(shpool, sizeof(ngx_http_auth_ldap_node_t));
+    if (node==NULL){
+        ngx_shmtx_unlock(&shpool->mutex);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "auth_ldap ran out of shm space. Increase the auth_digest_shm_size limit.");
+        //TODO: Really?
+        return *node;
+    }
+
+    //TODO: make this configurable
+    node->expires = ngx_time() + 300;
+    node->server_alias = server->alias;
+    node->username = uinfo->username;
+
+    node->password_hash = ngx_http_auth_ldap_get_password_hash(&uinfo->username, &uinfo->password);
+
+    ((ngx_rbtree_node_t *)node)->key = key;
+    ngx_rbtree_insert(ngx_http_auth_ldap_rbtree, &node->node);
+
+    ngx_shmtx_unlock(&shpool->mutex);
+    return *node;
+}
+
+static ngx_str_t ngx_http_auth_ldap_get_password_hash (ngx_str_t *username, ngx_str_t *password)
+{
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    ngx_str_t rv;
+    SHA1(password->data, password->len, hash);
+    rv.data = hash;
+    rv.len = sizeof hash;
+    return rv;
+}
+
+static ngx_int_t
+ngx_http_auth_ldap_worker_init(ngx_cycle_t *cycle){
+    if (ngx_process != NGX_PROCESS_WORKER){
+        return NGX_OK;
+    }
+
+    // create a cleanup queue big enough for the max number of tree nodes in the shm
+    ngx_http_auth_ldap_cleanup_list = ngx_array_create(cycle->pool,
+                                                      NGX_HTTP_AUTH_LDAP_CLEANUP_BATCH_SIZE,
+                                                      sizeof(ngx_rbtree_node_t *));
+    if (ngx_http_auth_ldap_cleanup_list==NULL){
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0, "Could not allocate shared memory for auth_ldap");
+        return NGX_ERROR;
+    }
+
+    ngx_connection_t  *dummy;
+    dummy = ngx_pcalloc(cycle->pool, sizeof(ngx_connection_t));
+    if (dummy == NULL) return NGX_ERROR;
+    dummy->fd = (ngx_socket_t) -1;
+    dummy->data = cycle;
+
+    ngx_http_auth_ldap_cleanup_timer->log = ngx_cycle->log;
+    ngx_http_auth_ldap_cleanup_timer->data = dummy;
+    ngx_http_auth_ldap_cleanup_timer->handler = ngx_http_auth_ldap_cleanup;
+    ngx_add_timer(ngx_http_auth_ldap_cleanup_timer, NGX_HTTP_AUTH_LDAP_CLEANUP_INTERVAL);
+    return NGX_OK;
+}
+
+/**
  * Init module and add ldap auth handler to NGX_HTTP_ACCESS_PHASE
  */
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf) {
     ngx_http_handler_pt *h;
     ngx_http_core_main_conf_t *cmcf;
+    ngx_str_t                  *shm_name;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
@@ -820,5 +1180,26 @@ static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf) {
     }
 
     *h = ngx_http_auth_ldap_handler;
-    return NGX_OK;
+
+  ngx_http_auth_ldap_cleanup_timer = ngx_pcalloc(cf->pool, sizeof(ngx_event_t));
+  if (ngx_http_auth_ldap_cleanup_timer == NULL) {
+    return NGX_ERROR;
+  }
+
+  shm_name = ngx_palloc(cf->pool, sizeof *shm_name);
+  shm_name->len = sizeof("auth_ldap");
+  shm_name->data = (unsigned char *) "auth_ldap";
+
+  if (ngx_http_auth_ldap_shm_size == 0) {
+    ngx_http_auth_ldap_shm_size = 4 * 256 * ngx_pagesize; // default to 4mb
+  }
+
+  ngx_http_auth_ldap_shm_zone = ngx_shared_memory_add(
+    cf, shm_name, ngx_http_auth_ldap_shm_size, &ngx_http_auth_ldap_module);
+  if (ngx_http_auth_ldap_shm_zone == NULL) {
+    return NGX_ERROR;
+  }
+  ngx_http_auth_ldap_shm_zone->init = ngx_http_auth_ldap_init_shm_zone;
+
+  return NGX_OK;
 }
