@@ -74,3 +74,6 @@ And add required servers in correct order into your location/server directive:
 
 }
 ```
+
+## Known issues/improvement ideas
+- Cache is stored by username, it will misbehave in case you have same username for different users on different ldap servers configured for different locations. Say you have LDAPA and LDAPB which have user "admin", and you want location A to authenticate against LDAPA, and location B against LDAPB. In this scenario cache won't be used.

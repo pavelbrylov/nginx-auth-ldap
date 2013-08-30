@@ -85,9 +85,10 @@ static ngx_atomic_t *ngx_http_auth_ldap_cleanup_lock;
 typedef struct {
     ngx_rbtree_node_t node;    // the node's .key is derived from the nonce val
     time_t            expires; // time at which the node should be evicted
-    ngx_str_t username;
-    ngx_str_t password_hash;
-    ngx_str_t server_alias;
+    u_char username[100];
+    u_char password_hash[SHA_DIGEST_LENGTH+1];
+    u_char server_alias[100];
+    u_char client_ip[30];
 } ngx_http_auth_ldap_node_t;
 
 static void * ngx_http_auth_ldap_create_conf(ngx_conf_t *cf);
@@ -121,9 +122,10 @@ static void ngx_http_auth_ldap_rbtree_prune(ngx_log_t *log);
 static void ngx_http_auth_ldap_rbtree_prune_walk(ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel, time_t now, ngx_log_t *log);
 static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request_t *r, ngx_ldap_userinfo *uinfo, ngx_ldap_server *server);
 static ngx_rbtree_node_t * ngx_http_auth_ldap_rbtree_find(ngx_rbtree_key_t key, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
-static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo, ngx_ldap_server *server);
-static ngx_str_t ngx_http_auth_ldap_get_password_hash (ngx_str_t *username, ngx_str_t *password);
-
+static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo);
+//static ngx_str_t ngx_http_auth_ldap_get_password_hash (ngx_str_t *username, ngx_str_t *password);
+//static void ngx_http_auth_ldap_get_password_hash (const ngx_str_t *username, const ngx_str_t *password, ngx_str_t *hash);
+static void ngx_http_auth_ldap_get_password_hash (ngx_http_request_t *r, const ngx_str_t *username, const ngx_str_t *password, u_char *hash);
 
 static ngx_command_t ngx_http_auth_ldap_commands[] = {
     {
@@ -189,7 +191,7 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
     char *rv;
     ngx_str_t                 *value, name;
     ngx_conf_t                save;
-    ngx_ldap_server           server, *s;
+    ngx_ldap_server           *s;
     ngx_http_auth_ldap_conf_t *cnf = conf;
 
     value = cf->args->elts;
@@ -200,8 +202,6 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "Error: no name of ldap server specified");
         return NGX_CONF_ERROR;
     }
-
-    server.alias = name;
 
     if (cnf->servers == NULL) {
         cnf->servers = ngx_array_create(cf->pool, 7, sizeof(ngx_ldap_server));
@@ -214,8 +214,7 @@ ngx_http_auth_ldap_ldap_server_block(ngx_conf_t *cf, ngx_command_t *cmd, void *c
     if (s == NULL) {
         return NGX_CONF_ERROR;
     }
-
-    *s = server;
+    s->alias = name;
 
     save = *cf;
     cf->handler = ngx_http_auth_ldap_ldap_server;
@@ -609,6 +608,62 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
 
     shpool = (ngx_slab_pool_t *)ngx_http_auth_ldap_shm_zone->shm.addr;
 
+    key = nginx_http_auth_ldap_get_cache_key(uinfo);
+
+    ngx_shmtx_lock(&shpool->mutex);
+	ngx_http_auth_ldap_node_t *cached_credentials = (ngx_http_auth_ldap_node_t *)ngx_http_auth_ldap_rbtree_find(
+			key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
+	ngx_shmtx_unlock(&shpool->mutex);
+
+	if (cached_credentials != NULL) {
+		if (ngx_strncmp(uinfo->username.data, cached_credentials->username, uinfo->username.len) == 0) {
+
+			// Check that client ip is same first
+			if (ngx_strncmp(r->connection->addr_text.data, cached_credentials->client_ip, r->connection->addr_text.len) == 0) {
+
+				unsigned char hash[SHA_DIGEST_LENGTH];
+				ngx_http_auth_ldap_get_password_hash(r, &uinfo->username, &uinfo->password, hash);
+				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "Comparing password hashes: %s == %s", hash, cached_credentials->password_hash);
+
+				if (ngx_strncmp(hash, cached_credentials->password_hash, SHA_DIGEST_LENGTH) == 0) {
+					int alias_found = 0;
+					for (k = 0; k < conf->servers->nelts; k++) {
+			            server = &servers[k];
+			            if (ngx_strncmp(server->alias.data, cached_credentials->server_alias, server->alias.len) == 0) {
+			                alias_found = 1;
+			            }
+					}
+					if (alias_found == 1) {
+						ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "User %s passed all checks, using cache to allow access", r->connection->addr_text.data, cached_credentials->username);
+						return NGX_OK;
+					} else {
+						ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "LDAP: User %s passed all checks, but cached data is from different LDAP server", r->connection->addr_text.data, cached_credentials->username);
+					}
+
+				} else {
+					// TODO: Really?
+					// TODO: Delete cache?
+					ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "User %s was found in ldap cache, but password does not match", uinfo->username.data);
+					cached_credentials->expires = ngx_time();
+					//return ngx_http_auth_ldap_set_realm(r, &conf->realm);
+				}
+			} else {
+				ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "LDAP: User %s was found in ldap cache, but IP does not match: %s != %s", uinfo->username.data, r->connection->addr_text.data, cached_credentials->client_ip);
+				cached_credentials->expires = ngx_time();
+				// TODO: Delete cache
+				// TODO: Really?
+				//return ngx_http_auth_ldap_set_realm(r, &conf->realm);
+			}
+		} else {
+			ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "LDAP: Possible hash collision: hash keys match, but usernames are not the same (%s != %s)!", uinfo->username.data, cached_credentials->username);
+			cached_credentials->expires = ngx_time();
+			// TODO: Delete cache
+		}
+	}
+
+	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "Nothing found in cache, using LDAP auth");
+
+
     /// Set LDAP version to 3 and set connection timeout.
     ldap_set_option(NULL, LDAP_OPT_PROTOCOL_VERSION, &version);
     ldap_set_option(NULL, LDAP_OPT_NETWORK_TIMEOUT, &timeOut);
@@ -624,32 +679,11 @@ static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http
     for (k = 0; k < conf->servers->nelts; k++) {
         alias = ((ngx_str_t*)conf->servers->elts + k);
         found = 0;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "CLIENT IP: %s", r->connection->addr_text.data);
         for (i = 0; i < mconf->servers->nelts; i++) {
             server = &servers[i];
             if (server->alias.len == alias->len && ngx_strncmp(server->alias.data, alias->data, server->alias.len) == 0) {
                 found = 1;
-
-                key = nginx_http_auth_ldap_get_cache_key(uinfo, server);
-                // TODO: Mutex??
-                ngx_shmtx_lock(&shpool->mutex);
-                ngx_http_auth_ldap_node_t *found = (ngx_http_auth_ldap_node_t *)ngx_http_auth_ldap_rbtree_find(
-                        key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
-
-                ngx_shmtx_unlock(&shpool->mutex);
-                if (found != NULL) {
-                    if (uinfo->username.len == found->username.len && (ngx_strcmp(uinfo->username.data, found->username.data) == 0)) {
-                        ngx_str_t hash = ngx_http_auth_ldap_get_password_hash(&uinfo->username, &uinfo->password);
-                        if (hash.len == found->password_hash.len) {
-                            return NGX_OK;
-                        } else {
-                            // TODO: Really?
-                            return ngx_http_auth_ldap_set_realm(r, &conf->realm);
-                        }
-                    } else {
-                        // TODO: Should be warning
-                        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "USERNAME IS NOT SAME!", NULL);
-                    }
-                }
 
                 pass = ngx_http_auth_ldap_authenticate_against_server(r, server, uinfo, conf);
                 if (pass == 1) {
@@ -1075,10 +1109,9 @@ static void ngx_http_auth_ldap_rbtree_prune_walk(ngx_rbtree_node_t *node, ngx_rb
 /**
  * Returns simple hash key to use in rbtree
  */
-static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo, ngx_ldap_server *server)
+static ngx_uint_t nginx_http_auth_ldap_get_cache_key (ngx_ldap_userinfo *uinfo)
 {
-    return ngx_crc32_long(uinfo->username.data, uinfo->username.len) ^
-           ngx_crc32_long(server->alias.data, server->alias.len);
+    return ngx_crc32_long(uinfo->username.data, uinfo->username.len);
 
 }
 
@@ -1093,14 +1126,14 @@ static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request
     shpool = (ngx_slab_pool_t *)ngx_http_auth_ldap_shm_zone->shm.addr;
 
     // create a cache record
-    key = nginx_http_auth_ldap_get_cache_key(uinfo, server);
+    key = nginx_http_auth_ldap_get_cache_key(uinfo);
     ngx_shmtx_lock(&shpool->mutex);
-    ngx_rbtree_node_t *found = ngx_http_auth_ldap_rbtree_find(key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
 
-    if (found!=NULL){
+    ngx_http_auth_ldap_node_t *found = (ngx_http_auth_ldap_node_t *)ngx_http_auth_ldap_rbtree_find(key, ngx_http_auth_ldap_rbtree->root, ngx_http_auth_ldap_rbtree->sentinel);
+	if (found!=NULL){
         ngx_shmtx_unlock(&shpool->mutex);
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "Trying to store cache which already exist. This is so wrong and looks like hash collision!");
+                      "Trying to store cache which already exist. This is so wrong and looks like hash collision! Username in cache - %s, username provided - %s", found->username, uinfo->username.data);
     }
 
     node = ngx_slab_alloc_locked(shpool, sizeof(ngx_http_auth_ldap_node_t));
@@ -1114,10 +1147,14 @@ static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request
 
     //TODO: make this configurable
     node->expires = ngx_time() + 300;
-    node->server_alias = server->alias;
-    node->username = uinfo->username;
+    //node->server_alias = ngx_slab_alloc_locked(shpool, server->alias.len);
+    ngx_memcpy(node->server_alias, server->alias.data, server->alias.len);
+    ngx_memcpy(node->username, uinfo->username.data, uinfo->username.len);
+    ngx_memcpy(node->client_ip, r->connection->addr_text.data, r->connection->addr_text.len);
 
-    node->password_hash = ngx_http_auth_ldap_get_password_hash(&uinfo->username, &uinfo->password);
+    ngx_http_auth_ldap_get_password_hash(r, &uinfo->username, &uinfo->password, node->password_hash);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "GET HASH RESULT: %s", node->password_hash);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "GET HASH RESULT: %d", ngx_strlen(node->password_hash));
 
     ((ngx_rbtree_node_t *)node)->key = key;
     ngx_rbtree_insert(ngx_http_auth_ldap_rbtree, &node->node);
@@ -1126,14 +1163,17 @@ static ngx_http_auth_ldap_node_t ngx_http_auth_ldap_cache_store(ngx_http_request
     return *node;
 }
 
-static ngx_str_t ngx_http_auth_ldap_get_password_hash (ngx_str_t *username, ngx_str_t *password)
+static void ngx_http_auth_ldap_get_password_hash (ngx_http_request_t *r, const ngx_str_t *username, const ngx_str_t *password, u_char *hash)
 {
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    ngx_str_t rv;
-    SHA1(password->data, password->len, hash);
-    rv.data = hash;
-    rv.len = sizeof hash;
-    return rv;
+
+	 u_char buf[password->len + username->len + sizeof('|')];
+	 u_char *p;
+     p = buf;
+
+	 p = ngx_snprintf(p, sizeof buf, "%s|%s", username->data, password->data);
+	 *p = '\0';
+    SHA1(buf, ngx_strlen(buf), hash);
+    hash[SHA_DIGEST_LENGTH] = '\0';
 }
 
 static ngx_int_t
